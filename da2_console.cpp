@@ -236,7 +236,6 @@ constexpr int GUI_LOGIN_HOST = 59;
 constexpr bool g_blockLogin = true;
 static volatile LONG g_loginCloseAt = 0;
 static volatile LONG g_loginRecoverAt = 0;
-static volatile LONG g_probeScreen1At = 0;
 static volatile LONG g_screen1Live    = 0;
 
 static char __fastcall hkOpenScreen(void* thiz, void* edx, int typeId) {
@@ -247,8 +246,6 @@ static char __fastcall hkOpenScreen(void* thiz, void* edx, int typeId) {
         InterlockedExchange(&g_lastScreenOpen, typeId);
         Log("[DA2] screen OPEN  type=%d (0x%X)\n", typeId, typeId);
     }
-    if (typeId == 1)
-        InterlockedExchange(&g_probeScreen1At, (LONG)(GetTickCount() + 300));
     if (typeId == GUI_LOGIN && g_blockLogin) {
         InterlockedExchange(&g_loginCloseAt, (LONG)(GetTickCount() + 120));
         Log("[DA2] login screen (type 39) opened -- closing it\n");
@@ -437,9 +434,7 @@ static const wchar_t* kGuiMovies[] = {
     L"armycontrol", L"ArmyControl", L"audiogui", L"battlemenu",
     L"BattleMenu", L"bookback", L"bookfront", L"chanters",
     L"characterrecord", L"CharacterRecord", L"chargen", L"CharGen",
-    L"chargen_stage2", L"CharGenStage2", L"ChargenStage2",
-    L"CharGen_Stage2", L"Chargen_Stage2", L"chargenstage2",
-    L"CharGenStage_2", L"CharacterGeneration", L"charactergeneration",
+    L"CharGen_Stage2",
     L"combinedhud", L"CombinedHUD", L"container",
     L"Container", L"controllerlayout", L"conversation", L"Conversation",
     L"crafting", L"Crafting", L"deathscreen", L"DeathScreen",
@@ -941,6 +936,11 @@ static const TutorialSwap kTutorialSwaps[] = {
     { L"Miasmic Flask stuns targets in a small area. <LeftClickDefaultCapped/> Miasmic Flask in the quickbar to use it now.",
       L"Miasmic Flask stuns targets in a small area. Choose Miasmic Flask from your battle menu to use it now." },
 
+    { L"For more effective control during battle, pause the game and issue orders to your party members.",
+      L"For more effective control during battle, pull <LT/> to open the radial menu. The game pauses while it is open, so you can issue orders to your party." },
+    { L"Press the space bar to pause the game and issue orders to your party.",
+      L"Pull <LT/> to open the radial menu. The game pauses while it is open, so you can issue orders to your party." },
+
     { L"You can order potions if you discover the right combination of resources, along with a recipe. Resources you've discovered are permanently available to craftsmen, but placing an order costs money. To use a potion you've ordered, press <InventoryKey/> to open the inventory, then drag it from the Usable Items tab into your quickbar.",
       L"You can order potions if you discover the right combination of resources, along with a recipe. Resources you've discovered are permanently available to craftsmen, but placing an order costs money. To use a potion you've ordered, press <Start/> and select \"Inventory\", then assign it from the Usable Items tab." },
     { L"You can order poisons and bombs if you discover the right combination of resources, along with a recipe. Resources you've discovered are permanently available to craftsmen, but placing an order costs money. To apply poison to melee weapons or throw a bomb at enemies, press <InventoryKey/> to open the inventory, then drag the item from the Usable Items tab into your quickbar.",
@@ -1083,19 +1083,6 @@ static bool TrySwapLoadingTip(void* args, int i) {
 static char __fastcall hkInvokeAS(void* thiz, void* edx, const char* method,
                                   void* ret, void* args, int argc) {
     __try {
-
-        if (method && InterlockedCompareExchange(&g_screen1Live, 0, 0)) {
-            static char seen[64][64];
-            static int sn = 0;
-            bool isNew = true;
-            for (int k = 0; k < sn; ++k)
-                if (strcmp(seen[k], method) == 0) { isNew = false; break; }
-            if (isNew && sn < 64) {
-                strncpy_s(seen[sn], method, _TRUNCATE);
-                ++sn;
-                Log("[DA2] CHARGEN AS2: %s\n", method);
-            }
-        }
         if (method && strstr(method, "DisplayNewLoadingText") && args) {
             for (int i = 0; i < argc && i < 4; ++i)
                 if (TrySwapLoadingTip(args, i)) break;
@@ -1202,18 +1189,6 @@ static uint8_t __cdecl hkDispatch(void* msg, uintptr_t target) {
     __except (EXCEPTION_EXECUTE_HANDLER) { name = nullptr; }
 
     RumbleForMessage(name);
-
-    if (name && InterlockedCompareExchange(&g_screen1Live, 0, 0)) {
-        static const char* seen[64] = {};
-        static int sn = 0;
-        bool isNew = true;
-        for (int k = 0; k < sn; ++k)
-            if (seen[k] == name || strcmp(seen[k], name) == 0) { isNew = false; break; }
-        if (isNew && sn < (int)_countof(seen)) {
-            seen[sn++] = name;
-            Log("[DA2] CHARGEN MSG: %s\n", name);
-        }
-    }
 
     static volatile LONG s_inHide = 0;
     if (g_radialVisible && IsRadialCommitMessage(name)
@@ -1330,8 +1305,6 @@ static bool g_hideCursor = true;
 static bool CursorShouldHide() {
     if (!kCursorHide) return false;
     if (!g_hideCursor) return false;
-
-    if (InterlockedCompareExchange(&g_screen1Live, 0, 0)) return false;
     HWND fg = GetForegroundWindow();
     if (fg && fg != GameWindow()) return false;
     return true;
@@ -2763,56 +2736,6 @@ static void PollRadialStaleHide() {
     Log("[DA2] radial: cleared stale panel after area load\n");
 }
 
-static void PollScreen1Probe() {
-    LONG at = InterlockedCompareExchange(&g_probeScreen1At, 0, 0);
-    if (!at || (LONG)(GetTickCount() - (DWORD)at) < 0) return;
-    InterlockedExchange(&g_probeScreen1At, 0);
-
-    void* gui = GuiSystem();
-    if (!gui) { Log("[DA2] PROBE1: no GUI system\n"); return; }
-
-    __try {
-        void** vt = *reinterpret_cast<void***>(gui);
-        auto get = reinterpret_cast<GetScreenByType_t>(vt[0x6C / 4]);
-        void* scr = get(gui, 1);
-        if (!scr) { Log("[DA2] PROBE1: no screen object for type 1\n"); return; }
-
-        __try {
-            void** vft = *reinterpret_cast<void***>(scr);
-            void*  col = vft[-1];
-            const char* cname =
-                reinterpret_cast<const char*>(reinterpret_cast<void**>(col)[3]) + 8;
-            Log("[DA2] PROBE1: screen class %s\n", cname);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            Log("[DA2] PROBE1: class name unreadable\n");
-        }
-
-        const uint8_t* s = reinterpret_cast<const uint8_t*>(scr) + OFF_SCREEN_MOVIENAME;
-        char hex[3 * 24 + 1] = {};
-        char asc[24 + 1] = {};
-        for (int i = 0; i < 24; ++i) {
-            _snprintf_s(hex + i * 3, 4, _TRUNCATE, "%02X ", s[i]);
-            asc[i] = (s[i] >= 0x20 && s[i] < 0x7F) ? (char)s[i] : '.';
-        }
-        Log("[DA2] PROBE1: +A8 %s |%s|\n", hex, asc);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("[DA2] PROBE1: screen read faulted\n");
-    }
-
-    char line[900];
-    line[0] = 0;
-    int p = 0, n = 0;
-    for (const wchar_t* m : kGuiMovies) {
-        if (!ResolveMovieView(m)) continue;
-        ++n;
-        if (p < (int)sizeof(line) - 40) {
-            const int w = _snprintf_s(line + p, sizeof(line) - p, _TRUNCATE, " %ls", m);
-            if (w > 0) p += w;
-        }
-    }
-    Log("[DA2] PROBE1: %d movies resolve:%s\n", n, line);
-}
-
 static void PollScreen1Watch() {
     LONG live = 0;
     void* gui = GuiSystem();
@@ -2828,8 +2751,7 @@ static void PollScreen1Watch() {
         } __except (EXCEPTION_EXECUTE_HANDLER) { live = 0; }
     }
     if (InterlockedExchange(&g_screen1Live, live) != live)
-        Log("[DA2] PROBE1: screen 1 %s\n",
-            live ? "OPEN -- cursor freed, logging its messages" : "closed");
+        Log("[DA2] chargen screen %s\n", live ? "open" : "closed");
 }
 
 static void PollRadialTrigger() {
@@ -2901,41 +2823,6 @@ static void __cdecl hkFsSendMessage(void* ctx, const char* args) {
             Log("[DA2] %.400s\n", args);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     oFsSendMessage(ctx, args);
-}
-
-static ResolveMovie_t oResolveMovie = nullptr;
-
-static void* __fastcall hkResolveMovie(void* reg, void* edx, void* key) {
-    void* r = oResolveMovie(reg, edx, key);
-    if (r && key && InterlockedCompareExchange(&g_screen1Live, 0, 0)) {
-        __try {
-            static unsigned char seen[32][24] = {};
-            static int sn = 0;
-            const unsigned char* k = reinterpret_cast<const unsigned char*>(key);
-            bool isNew = true;
-            for (int i = 0; i < sn; ++i)
-                if (memcmp(seen[i], k, 24) == 0) { isNew = false; break; }
-            if (isNew && sn < 32) {
-                memcpy(seen[sn], k, 24);
-                ++sn;
-
-                char hex[3 * 24 + 1] = {};
-                char asc[24 + 1] = {};
-                for (int i = 0; i < 24; ++i) {
-                    _snprintf_s(hex + i * 3, 4, _TRUNCATE, "%02X ", k[i]);
-                    asc[i] = (k[i] >= 0x20 && k[i] < 0x7F) ? (char)k[i] : '.';
-                }
-                Log("[DA2] RESOLVE: %s |%s|\n", hex, asc);
-                Log("[DA2] RESOLVE   inline=\"%.23ls\"\n",
-                    reinterpret_cast<const wchar_t*>(k));
-                const wchar_t* p = *reinterpret_cast<const wchar_t* const*>(k);
-                if (reinterpret_cast<uintptr_t>(p) >= 0x10000
-                    && reinterpret_cast<uintptr_t>(p) < 0x80000000)
-                    Log("[DA2] RESOLVE   deref =\"%.31ls\"\n", p);
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-    return r;
 }
 
 static void* ResolveMovieView(const wchar_t* name) {
@@ -3294,7 +3181,6 @@ static float __fastcall hkActionAnalog(void* thiz, void* edx, uint32_t* handle) 
         PollCursorHide();
         PollCursorPark();
         PollLoginBlock();
-        PollScreen1Probe();
         PollScreen1Watch();
         PollCursorToggleKey();
         PollRumbleStop();
@@ -3313,18 +3199,6 @@ static float __fastcall hkActionAnalog(void* thiz, void* edx, uint32_t* handle) 
     if (DialogIsOpen()) {
         if (handle && handle[0] == ACT_GUI_LT) { LogDialogState(); PumpDialogInput(); }
         return oActionAnalog(thiz, edx, handle);
-    }
-
-    if (handle && InterlockedCompareExchange(&g_screen1Live, 0, 0)) {
-        static uint32_t seen[128] = {};
-        static int sn = 0;
-        bool isNew = true;
-        for (int k = 0; k < sn; ++k)
-            if (seen[k] == handle[0]) { isNew = false; break; }
-        if (isNew && sn < 128) {
-            seen[sn++] = handle[0];
-            Log("[DA2] CHARGEN ACT-A: 0x%02X\n", handle[0]);
-        }
     }
 
     if (handle) {
@@ -3421,18 +3295,6 @@ static float __fastcall hkActionAnalog(void* thiz, void* edx, uint32_t* handle) 
 static char __fastcall hkActionDigital(void* thiz, void* edx, uint32_t* handle) {
 
     if (DialogIsOpen()) return oActionDigital(thiz, edx, handle);
-
-    if (handle && InterlockedCompareExchange(&g_screen1Live, 0, 0)) {
-        static uint32_t seen[128] = {};
-        static int sn = 0;
-        bool isNew = true;
-        for (int k = 0; k < sn; ++k)
-            if (seen[k] == handle[0]) { isNew = false; break; }
-        if (isNew && sn < 128) {
-            seen[sn++] = handle[0];
-            Log("[DA2] CHARGEN ACT-D: 0x%02X\n", handle[0]);
-        }
-    }
 
     if (handle && InterlockedCompareExchange(&g_pad.valid, 1, 1)) {
         switch (handle[0]) {
@@ -4335,7 +4197,6 @@ static DWORD WINAPI InitThread(LPVOID) {
 
     Arm(0x0076B880,           &hkInvokeAS,      (LPVOID*)&oInvokeAS,      "Movie::InvokeAS (tutorial swap)");
     Arm(ADDR_FSCMD_SENDMESSAGE, &hkFsSendMessage, (LPVOID*)&oFsSendMessage, "fscommand SendMessage (AS2 trace pipe)");
-    Arm(ADDR_RESOLVE_MOVIE,   &hkResolveMovie,  (LPVOID*)&oResolveMovie,  "ResolveMovie (name probe)");
     Arm(ADDR_DISPATCH,        &hkDispatch,      (LPVOID*)&oDispatch,      "Dispatch (rumble + radial close)");
     Arm(ADDR_CURSOR_POS,        &hkCursorPos,        (LPVOID*)&oCursorPos,        "cursor position (auto-aim feed)");
     Arm(ADDR_HOVER_UPDATE,      &hkHoverUpdate,      (LPVOID*)&oHoverUpdate,      "hover updater (capture owner)");
