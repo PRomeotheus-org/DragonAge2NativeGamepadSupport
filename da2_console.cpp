@@ -1,4 +1,6 @@
 // Dragon Age II -- console controls and console UI for the PC build.
+// Release build: no diagnostic output. See the development source for why any
+// of this is shaped the way it is.
 
 #include <windows.h>
 #include <shlobj.h>
@@ -42,10 +44,6 @@ constexpr uintptr_t VFT_GAMEMODE_COMBAT    = 0x00BEEE44;
 constexpr uintptr_t ADDR_DIRSEARCH         = 0x006BDA10;
 constexpr uintptr_t ADDR_DIRSEARCH_CTX     = 0x00D4FBC8;
 constexpr uintptr_t ADDR_DIRSEARCH_RESULT  = 0x00D4FBDC;
-
-constexpr uintptr_t OFF_CAND_ARRAY         = 0x120;
-constexpr uintptr_t OFF_CAND_COUNT         = 0x710;
-constexpr uintptr_t CAND_STRIDE            = 0x30;
 
 constexpr uintptr_t ADDR_EXPLORE_PRIMARY   = 0x00496310;
 constexpr uintptr_t ADDR_EXPLORE_SECONDARY = 0x00496360;
@@ -204,7 +202,13 @@ static bool ReadPad(XINPUT_STATE& st) {
     return false;
 }
 
+constexpr bool kSpoofPlatform = true;
+
 static DWORD WINAPI SpoofThread(LPVOID) {
+    if (!kSpoofPlatform) {
+        Log("[DA2] platform spoof DISABLED (bisect) -- UI will look like PC\n");
+        return 0;
+    }
     uintptr_t slot = R(ADDR_SCALEFORM_MGR_PTR);
     void* inst = nullptr;
     while (!inst) { inst = *reinterpret_cast<void**>(slot); if (!inst) Sleep(1); }
@@ -226,34 +230,14 @@ static volatile LONG g_lastScreenOpen = -1;
 constexpr uintptr_t OFF_SCREEN_MOVIENAME = 0xA8;
 typedef void* (__thiscall* GetScreenByType_t)(void*, int);
 
-static void LogScreenMovie(int typeId) {
-    void* gui = GuiSystem();
-    if (!gui) return;
-    __try {
-        void** vt = *reinterpret_cast<void***>(gui);
-        auto get = reinterpret_cast<GetScreenByType_t>(vt[0x6C / 4]);
-        void* scr = get(gui, typeId);
-        if (!scr) { Log("[DA2]   screen %d -> (no screen object)\n", typeId); return; }
-
-        const uint8_t* s = reinterpret_cast<const uint8_t*>(scr) + OFF_SCREEN_MOVIENAME;
-        char hex[3 * 24 + 1] = {};
-        char asc[24 + 1] = {};
-        for (int i = 0; i < 24; ++i) {
-            _snprintf_s(hex + i * 3, 4, _TRUNCATE, "%02X ", s[i]);
-            asc[i] = (s[i] >= 0x20 && s[i] < 0x7F) ? (char)s[i] : '.';
-        }
-        Log("[DA2]   screen %d +0xA8: %s |%s|\n", typeId, hex, asc);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("[DA2]   screen %d -> movie name read faulted\n", typeId);
-    }
-}
-
 constexpr int GUI_LOGIN      = 39;
 constexpr int GUI_LOGIN_HOST = 59;
 
 constexpr bool g_blockLogin = true;
 static volatile LONG g_loginCloseAt = 0;
 static volatile LONG g_loginRecoverAt = 0;
+static volatile LONG g_probeScreen1At = 0;
+static volatile LONG g_screen1Live    = 0;
 
 static char __fastcall hkOpenScreen(void* thiz, void* edx, int typeId) {
     if (typeId == GUI_QUICKBAR && InterlockedCompareExchange(&g_blockQuickbar, 1, 1))
@@ -262,8 +246,9 @@ static char __fastcall hkOpenScreen(void* thiz, void* edx, int typeId) {
     if (typeId != GUI_QUICKBAR) {
         InterlockedExchange(&g_lastScreenOpen, typeId);
         Log("[DA2] screen OPEN  type=%d (0x%X)\n", typeId, typeId);
-        LogScreenMovie(typeId);
     }
+    if (typeId == 1)
+        InterlockedExchange(&g_probeScreen1At, (LONG)(GetTickCount() + 300));
     if (typeId == GUI_LOGIN && g_blockLogin) {
         InterlockedExchange(&g_loginCloseAt, (LONG)(GetTickCount() + 120));
         Log("[DA2] login screen (type 39) opened -- closing it\n");
@@ -452,7 +437,10 @@ static const wchar_t* kGuiMovies[] = {
     L"armycontrol", L"ArmyControl", L"audiogui", L"battlemenu",
     L"BattleMenu", L"bookback", L"bookfront", L"chanters",
     L"characterrecord", L"CharacterRecord", L"chargen", L"CharGen",
-    L"chargen_stage2", L"combinedhud", L"CombinedHUD", L"container",
+    L"chargen_stage2", L"CharGenStage2", L"ChargenStage2",
+    L"CharGen_Stage2", L"Chargen_Stage2", L"chargenstage2",
+    L"CharGenStage_2", L"CharacterGeneration", L"charactergeneration",
+    L"combinedhud", L"CombinedHUD", L"container",
     L"Container", L"controllerlayout", L"conversation", L"Conversation",
     L"crafting", L"Crafting", L"deathscreen", L"DeathScreen",
     L"dialoguepop", L"DialoguePop", L"floatylayer", L"FloatyLayer",
@@ -778,30 +766,6 @@ static char __fastcall hkShowDialog(void* thiz, void* edx, void* msg) {
 typedef char (__fastcall* InvokeAS_t)(void*, void*, const char*, void*, void*, int);
 static InvokeAS_t oInvokeAS = nullptr;
 
-static const int   INVOKE_SEEN_MAX = 256;
-static char*       g_invokeSeen[INVOKE_SEEN_MAX] = {};
-static int         g_invokeSeenN = 0;
-static CRITICAL_SECTION g_invokeCs;
-static bool        g_invokeCsReady = false;
-
-static bool InvokeNameIsNew(const char* name) {
-    if (!g_invokeCsReady) return false;
-    bool fresh = false;
-    EnterCriticalSection(&g_invokeCs);
-    int i = 0;
-    for (; i < g_invokeSeenN; ++i)
-        if (g_invokeSeen[i] && strcmp(g_invokeSeen[i], name) == 0) break;
-    if (i == g_invokeSeenN && g_invokeSeenN < INVOKE_SEEN_MAX) {
-        size_t n = strlen(name) + 1;
-        char* copy = (char*)malloc(n);
-        if (copy) { memcpy(copy, name, n); g_invokeSeen[g_invokeSeenN++] = copy; fresh = true; }
-    }
-    LeaveCriticalSection(&g_invokeCs);
-    return fresh;
-}
-
-static volatile LONG g_invokeBurstUntil = 0;
-
 constexpr uintptr_t GFXVALUE_SIZE = 0x10;
 constexpr uintptr_t OFF_GFXVALUE_TYPE  = 0x04;
 constexpr uintptr_t OFF_GFXVALUE_VALUE = 0x08;
@@ -1072,9 +1036,70 @@ static bool TrySwapTutorialArg(void* args, int i) {
     return false;
 }
 
+static bool TipLooksLike(const wchar_t* pc, const wchar_t* tip) {
+    const wchar_t* bestP = nullptr;
+    size_t bestN = 0;
+    for (const wchar_t* p = pc; *p; ) {
+        if (*p == L'<') {
+            while (*p && *p != L'>') ++p;
+            if (*p) ++p;
+            continue;
+        }
+        const wchar_t* start = p;
+        while (*p && *p != L'<') ++p;
+        const wchar_t* end = p;
+        while (start < end && (*start == L' ' || *start == L'\n' || *start == L'\r')) ++start;
+        while (end > start && (end[-1] == L' ' || end[-1] == L'\n' || end[-1] == L'\r')) --end;
+        const size_t n = (size_t)(end - start);
+        if (n > bestN) { bestN = n; bestP = start; }
+    }
+    if (bestN < 18) return false;
+    for (const wchar_t* q = tip; *q; ++q)
+        if (wcsncmp(q, bestP, bestN) == 0) return true;
+    return false;
+}
+
+static bool TrySwapLoadingTip(void* args, int i) {
+    __try {
+        const uintptr_t v = (uintptr_t)args + (uintptr_t)i * GFXVALUE_SIZE;
+        const uint32_t ty = *reinterpret_cast<const uint32_t*>(v + OFF_GFXVALUE_TYPE);
+        if ((ty & 0x0F) != 5) return false;
+        if (ty & 0x40) return false;
+        const wchar_t** slot = reinterpret_cast<const wchar_t**>(v + OFF_GFXVALUE_VALUE);
+        const wchar_t* cur = *slot;
+        if (!LooksLikeWideText(cur)) return false;
+        for (const TutorialSwap& s : kTutorialSwaps) {
+            if (TutorialTextEqual(cur, s.pc) || TipLooksLike(s.pc, cur)) {
+                *slot = ExpandGlyphTags(s.console);
+                Log("[DA2] loading tip SWAPPED -> console wording\n");
+                return true;
+            }
+        }
+        LogWideChunked("tip NOT MAPPED:", cur);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
+
 static char __fastcall hkInvokeAS(void* thiz, void* edx, const char* method,
                                   void* ret, void* args, int argc) {
     __try {
+
+        if (method && InterlockedCompareExchange(&g_screen1Live, 0, 0)) {
+            static char seen[64][64];
+            static int sn = 0;
+            bool isNew = true;
+            for (int k = 0; k < sn; ++k)
+                if (strcmp(seen[k], method) == 0) { isNew = false; break; }
+            if (isNew && sn < 64) {
+                strncpy_s(seen[sn], method, _TRUNCATE);
+                ++sn;
+                Log("[DA2] CHARGEN AS2: %s\n", method);
+            }
+        }
+        if (method && strstr(method, "DisplayNewLoadingText") && args) {
+            for (int i = 0; i < argc && i < 4; ++i)
+                if (TrySwapLoadingTip(args, i)) break;
+        }
         if (method && strstr(method, "DisplayTutorial")) {
             Log("[DA2] TUTORIAL invoke: \"%s\"\n", method);
 
@@ -1089,18 +1114,6 @@ static char __fastcall hkInvokeAS(void* thiz, void* edx, const char* method,
                     if (body && wcslen(body) > 8)
                         LogWideChunked("tutorial NOT MAPPED:", body);
                 }
-            }
-        }
-        if (method) {
-
-            if (strstr(method, "Floaty") && !strstr(method, "ProcessBatchUpdates")) {
-                Log("[DA2] FLOATY: \"%s\" argc=%d\n", method, argc);
-            } else {
-                const LONG until = InterlockedCompareExchange(&g_invokeBurstUntil, 0, 0);
-                if (until && (LONG)GetTickCount() - until < 0)
-                    Log("[DA2] AS2 burst: \"%s\" argc=%d\n", method, argc);
-                else if (InvokeNameIsNew(method))
-                    Log("[DA2] AS2 invoke (new): \"%s\" argc=%d\n", method, argc);
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -1181,14 +1194,26 @@ static bool IsRadialCommitMessage(const char* n) {
     return false;
 }
 
+static void RumbleForMessage(const char* name);
+
 static uint8_t __cdecl hkDispatch(void* msg, uintptr_t target) {
-    const LONG until = InterlockedCompareExchange(&g_invokeBurstUntil, 0, 0);
     const char* name = nullptr;
     __try { name = MessageTypeName(msg); }
     __except (EXCEPTION_EXECUTE_HANDLER) { name = nullptr; }
 
-    if (until && (LONG)GetTickCount() - until < 0 && name)
-        Log("[DA2] MSG burst: %s\n", name);
+    RumbleForMessage(name);
+
+    if (name && InterlockedCompareExchange(&g_screen1Live, 0, 0)) {
+        static const char* seen[64] = {};
+        static int sn = 0;
+        bool isNew = true;
+        for (int k = 0; k < sn; ++k)
+            if (seen[k] == name || strcmp(seen[k], name) == 0) { isNew = false; break; }
+        if (isNew && sn < (int)_countof(seen)) {
+            seen[sn++] = name;
+            Log("[DA2] CHARGEN MSG: %s\n", name);
+        }
+    }
 
     static volatile LONG s_inHide = 0;
     if (g_radialVisible && IsRadialCommitMessage(name)
@@ -1202,40 +1227,20 @@ static uint8_t __cdecl hkDispatch(void* msg, uintptr_t target) {
     return oDispatch(msg, target);
 }
 
-static void PollInvokeBurstKey() {
-    static bool prev = false;
-    const bool now = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-    if (now && !prev) {
-        InterlockedExchange(&g_invokeBurstUntil, (LONG)(GetTickCount() + 6000));
-        Log("[DA2] --- AS2 burst window OPEN (6s) -- hover something now ---\n");
-    }
-    prev = now;
-}
-
 typedef uint8_t (__fastcall* ExploreAct_t)(void* self, void* edx, void* msg);
 static ExploreAct_t oExplorePrimary   = nullptr;
 static ExploreAct_t oExploreSecondary = nullptr;
 
-static uint32_t HoveredObjIdRaw() {
-    __try { return *reinterpret_cast<uint32_t*>(R(ADDR_HOVERED_OBJ_ID)); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return 0xFFFFFFFF; }
-}
-
 static volatile LONG g_primaryRan = 0;
 
 static uint8_t __fastcall hkExplorePrimary(void* self, void* edx, void* msg) {
-    const uint32_t id = HoveredObjIdRaw();
-    const uint8_t  r  = oExplorePrimary(self, edx, msg);
+    const uint8_t r = oExplorePrimary(self, edx, msg);
     if (r) InterlockedExchange(&g_primaryRan, (LONG)GetTickCount());
-    Log("[DA2] EXPLORE primary: this=%p hovered=%08X -> returned %d\n", self, id, r);
     return r;
 }
 
 static uint8_t __fastcall hkExploreSecondary(void* self, void* edx, void* msg) {
-    const uint32_t id = HoveredObjIdRaw();
-    const uint8_t  r  = oExploreSecondary(self, edx, msg);
-    Log("[DA2] EXPLORE secondary: this=%p hovered=%08X -> returned %d\n", self, id, r);
-    return r;
+    return oExploreSecondary(self, edx, msg);
 }
 
 static bool g_autoAim = true;
@@ -1275,8 +1280,16 @@ static bool GameClientCentre(int* cx, int* cy) {
 typedef void (__fastcall* CursorPos_t)(void* thiz, void* edx, int32_t* out, uint32_t* handle);
 static CursorPos_t oCursorPos = nullptr;
 
+constexpr bool kCursorHide       = true;
+constexpr bool kCursorPark       = true;
+constexpr bool kCursorCentreFeed = false;
+
+static volatile LONG g_clientCx = 0;
+static volatile LONG g_clientCy = 0;
+
 static void __fastcall hkCursorPos(void* thiz, void* edx, int32_t* out, uint32_t* handle) {
     oCursorPos(thiz, edx, out, handle);
+    if (!kCursorCentreFeed) return;
     if (!g_centreRay || !out || !handle) return;
 
     if (g_radialVisible) return;
@@ -1288,8 +1301,10 @@ static void __fastcall hkCursorPos(void* thiz, void* edx, int32_t* out, uint32_t
     }
     __try {
         if (handle[0] != ACT_CURSOR_POSITION) return;
-        int cx = 0, cy = 0;
-        if (!GameClientCentre(&cx, &cy)) return;
+
+        const int cx = (int)InterlockedCompareExchange(&g_clientCx, 0, 0);
+        const int cy = (int)InterlockedCompareExchange(&g_clientCy, 0, 0);
+        if (cx <= 0 || cy <= 0) return;
 
         static bool said = false;
         if (!said) {
@@ -1313,7 +1328,10 @@ static SetCursorFn oSetCursorApi = nullptr;
 static bool g_hideCursor = true;
 
 static bool CursorShouldHide() {
+    if (!kCursorHide) return false;
     if (!g_hideCursor) return false;
+
+    if (InterlockedCompareExchange(&g_screen1Live, 0, 0)) return false;
     HWND fg = GetForegroundWindow();
     if (fg && fg != GameWindow()) return false;
     return true;
@@ -1351,6 +1369,7 @@ enum { PARK_OFF = 0, PARK_BR, PARK_BL, PARK_TR, PARK_TL, PARK_CENTER };
 constexpr int g_cursorPark = PARK_BR;
 
 static void PollCursorPark() {
+    if (!kCursorPark) return;
     if (g_cursorPark == PARK_OFF) return;
     if (!CursorShouldHide()) return;
     HWND hw = GameWindow();
@@ -1435,6 +1454,250 @@ static void PollCursorPark() {
     POINT cur{};
     if (GetCursorPos(&cur) && cur.x == p.x && cur.y == p.y) return;
     SetCursorPos(p.x, p.y);
+}
+
+typedef DWORD (WINAPI* XInputSetStateFn)(DWORD, XINPUT_VIBRATION*);
+static XInputSetStateFn oXInputSetState = nullptr;
+
+static DWORD WINAPI hkXInputSetState(DWORD idx, XINPUT_VIBRATION* v) {
+    static int logged = 0;
+    if (logged < 20) {
+        ++logged;
+        Log("[DA2] ENGINE XInputSetState(pad=%lu, L=%u R=%u)\n",
+            idx, v ? v->wLeftMotorSpeed : 0, v ? v->wRightMotorSpeed : 0);
+    }
+    return oXInputSetState(idx, v);
+}
+
+static DWORD g_rumbleUntil = 0;
+
+static void RumblePulse(WORD left, WORD right, DWORD ms) {
+    XINPUT_VIBRATION v{};
+    v.wLeftMotorSpeed  = left;
+    v.wRightMotorSpeed = right;
+    if (XInputSetState(0, &v) != ERROR_SUCCESS) return;
+    g_rumbleUntil = GetTickCount() + ms;
+}
+
+static void PollRumbleStop() {
+    if (!g_rumbleUntil) return;
+    if ((LONG)(GetTickCount() - g_rumbleUntil) < 0) return;
+    g_rumbleUntil = 0;
+    XINPUT_VIBRATION v{};
+    XInputSetState(0, &v);
+}
+
+constexpr bool kRumbleEnabled = true;
+
+static void RumbleForMessage(const char* name) {
+    if (!kRumbleEnabled || !name) return;
+    struct Trig { const char* needle; WORD l, r; DWORD ms; };
+    static const Trig kTrig[] = {
+
+        { "PerformPrimaryActionOnTargetUnderCursorMessage", 8000,  30000, 110 },
+        { "PerformDefaultActionOnTargetMessage",            8000,  30000, 110 },
+
+        { "PerformAbilityMessage",                          45000, 22000, 190 },
+        { "PerformAbilityOnSelectedTargetMessage",          45000, 22000, 190 },
+        { "PerformAbilityOnPlayerMessage",                  36000, 18000, 170 },
+
+        { "FireAOEAbilityMessage",                          62000, 32000, 280 },
+    };
+    for (const auto& t : kTrig)
+        if (strstr(name, t.needle)) { RumblePulse(t.l, t.r, t.ms); return; }
+}
+
+static uint32_t PlayerObjectId();
+static bool     InExploreMode();
+static void*    ResolveCamera();
+
+constexpr bool kDamageRumble = true;
+
+constexpr unsigned OFF_CRE_STATS_OWNER = 0x810;
+constexpr unsigned OFF_STAT_CURRENT    = 0x2C;
+constexpr unsigned OFF_STATS_BEGIN     = 0x200;
+constexpr unsigned OFF_STATS_END       = 0x204;
+constexpr int      STAT_INDEX_HEALTH   = 7;
+constexpr int      STAT_INDEX_STAMINA  = 10;
+constexpr int      STAT_MIN_ENTRIES    = 36;
+constexpr int      STAT_MAX_ENTRIES    = 128;
+constexpr unsigned STAT_DUMP_BYTES     = 0x40;
+constexpr unsigned STAT_SEARCH_BYTES   = 0x1000;
+
+static bool LooksHeap(uintptr_t p) {
+    return p >= 0x10000000 && p < 0x80000000 && (p & 3) == 0;
+}
+
+static bool Readable(uintptr_t p, size_t len) {
+    if (!p || !len) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<void*>(p), &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+    const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                           PAGE_EXECUTE_WRITECOPY;
+    if (!(mbi.Protect & readable)) return false;
+    const uintptr_t regionEnd =
+        reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    return p + len <= regionEnd;
+}
+
+static void** TryStatsAt(uintptr_t obj, int* outCount) {
+    if (!LooksHeap(obj)) return nullptr;
+    if (!Readable(obj + OFF_STATS_BEGIN, 8)) return nullptr;
+    const uintptr_t b = *reinterpret_cast<const uintptr_t*>(obj + OFF_STATS_BEGIN);
+    const uintptr_t e = *reinterpret_cast<const uintptr_t*>(obj + OFF_STATS_END);
+    if (!LooksHeap(b) || !LooksHeap(e) || e <= b) return nullptr;
+    const uintptr_t bytes = e - b;
+    if (bytes & 3) return nullptr;
+    const int n = (int)(bytes / 4);
+    if (n < STAT_MIN_ENTRIES || n > STAT_MAX_ENTRIES) return nullptr;
+    if (!Readable(b, bytes)) return nullptr;
+    void** v = reinterpret_cast<void**>(b);
+    for (int i = 0; i < n; ++i)
+        if (!LooksHeap(reinterpret_cast<uintptr_t>(v[i]))) return nullptr;
+    *outCount = n;
+    return v;
+}
+
+static void** FindStatsVector(uintptr_t cre, int* outCount, unsigned* outVia,
+                              int* outTried) {
+    *outTried = 0;
+    void** v = TryStatsAt(cre, outCount);
+    if (v) { *outVia = 0xFFFFFFFF; return v; }
+    for (unsigned off = 0; off < STAT_SEARCH_BYTES; off += 4) {
+        if (!Readable(cre + off, 4)) continue;
+        const uintptr_t p = *reinterpret_cast<const uintptr_t*>(cre + off);
+        if (!LooksHeap(p)) continue;
+        ++(*outTried);
+        v = TryStatsAt(p, outCount);
+        if (v) { *outVia = off; return v; }
+    }
+    return nullptr;
+}
+
+static void PollHealthStat() {
+    if (!kDamageRumble) return;
+
+    static DWORD steadySince = 0, leftAt = 0;
+    static bool  primed = false;
+    static uint32_t prevWho = 0;
+    static float prevHp = 0.0f, peakHp = 0.0f;
+
+    if (!InExploreMode()) {
+        if (!leftAt) leftAt = GetTickCount();
+        if (GetTickCount() - leftAt > 1500) {
+            steadySince = 0; primed = false; prevWho = 0;
+        }
+        return;
+    }
+    leftAt = 0;
+    if (!steadySince) steadySince = GetTickCount();
+    if (GetTickCount() - steadySince < 2000) return;
+
+    static DWORD last = 0;
+    const DWORD now = GetTickCount();
+    if (now - last < 100) return;
+    last = now;
+
+    static int said = 0;
+    #define HPSAY(...) do { if (said < 12) { ++said; Log(__VA_ARGS__); } } while (0)
+
+    void* app = AppSingleton();
+    if (!app) { HPSAY("[DA2] health stat: no app singleton\n"); return; }
+    const uint32_t me = PlayerObjectId();
+    if (me == 0 || me == 0xFFFFFFFF) {
+        HPSAY("[DA2] health stat: player id is %08X\n", me);
+        return;
+    }
+
+    void* obj = nullptr;
+    __try {
+        obj = reinterpret_cast<ResolveObject_t>(R(0x005A70C0))(app, nullptr, me);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        HPSAY("[DA2] health stat: resolve faulted for %08X\n", me);
+        return;
+    }
+    if (!obj) { HPSAY("[DA2] health stat: %08X did not resolve\n", me); return; }
+
+    const uintptr_t c = reinterpret_cast<uintptr_t>(obj);
+    if (!Readable(c, STAT_SEARCH_BYTES)) {
+        HPSAY("[DA2] health stat: creature @%08X not readable\n", (unsigned)c);
+        return;
+    }
+
+    static unsigned via = OFF_CRE_STATS_OWNER;
+    static bool viaKnown = true;
+    static DWORD lastSearch = 0;
+
+    int n = 0;
+    void** stats = nullptr;
+
+    if (viaKnown) {
+        uintptr_t owner = 0;
+        if (via == 0xFFFFFFFF) owner = c;
+        else if (Readable(c + via, 4))
+            owner = *reinterpret_cast<const uintptr_t*>(c + via);
+        stats = TryStatsAt(owner, &n);
+        if (!stats) viaKnown = false;
+    }
+
+    if (!stats) {
+        if (now - lastSearch < 3000) return;
+        lastSearch = now;
+        int tried = 0;
+        unsigned found = 0;
+        stats = FindStatsVector(c, &n, &found, &tried);
+        if (!stats) {
+            HPSAY("[DA2] health stat: no stats vector in creature %08X @%08X"
+                  " (%d candidates)\n", me, (unsigned)c, tried);
+            return;
+        }
+        via = found;
+        viaKnown = true;
+        Log("[DA2] health stat: stats relocated to cre+%03X, %d entries\n", via, n);
+    }
+
+    void* hp = stats[STAT_INDEX_HEALTH];
+    if (!Readable(reinterpret_cast<uintptr_t>(hp), STAT_DUMP_BYTES)) {
+        HPSAY("[DA2] health stat: stats[%d] @%08X not readable\n",
+              STAT_INDEX_HEALTH, (unsigned)(uintptr_t)hp);
+        viaKnown = false;
+        return;
+    }
+
+    float cur = 0.0f;
+    memcpy(&cur, reinterpret_cast<const void*>(
+               reinterpret_cast<uintptr_t>(hp) + OFF_STAT_CURRENT), sizeof(cur));
+    if (!(cur == cur) || cur < -1.0e6f || cur > 1.0e6f) return;
+
+    if (!primed || prevWho != me) {
+        primed = true;
+        prevWho = me;
+        prevHp = peakHp = cur;
+        Log("[DA2] damage rumble armed: Hawke %08X health %.1f\n", me, cur);
+        return;
+    }
+
+    if (cur > peakHp) peakHp = cur;
+
+    if (cur < prevHp - 0.05f) {
+        const float drop = prevHp - cur;
+        const float frac = (peakHp > 1.0f) ? drop / peakHp : 0.0f;
+
+        float f = frac * 4.0f;
+        if (f < 0.18f) f = 0.18f;
+        if (f > 1.00f) f = 1.00f;
+        const WORD lo = (WORD)(22000.0f + 43000.0f * f);
+        const WORD hi = (WORD)(10000.0f + 26000.0f * f);
+        const DWORD ms = (DWORD)(110.0f + 180.0f * f);
+        RumblePulse(lo, hi, ms);
+        Log("[DA2] hit: %.1f -> %.1f of %.0f (-%.0f%%)\n",
+            prevHp, cur, peakHp, frac * 100.0f);
+    }
+    prevHp = cur;
+    #undef HPSAY
 }
 
 static void PollCursorToggleKey() {
@@ -1689,7 +1952,15 @@ static void* ResolveCamera() {
     }
 }
 
+constexpr bool kUseCameraBasis = true;
+
 static bool CameraForward2D(float* outX, float* outY) {
+    if (!kUseCameraBasis) {
+        static bool said = false;
+        if (!said) { said = true;
+            Log("[DA2] camera basis DISABLED (bisect) -- auto-aim uses player facing\n"); }
+        return false;
+    }
     __try {
         void* cam = ResolveCamera();
         if (!cam) return false;
@@ -1717,44 +1988,172 @@ static bool CameraForward2D(float* outX, float* outY) {
     }
 }
 
-static void PollCameraProbeKey() {
-    static bool prev = false;
-    const bool now = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-    if (!now || prev) { prev = now; return; }
-    prev = now;
-
-    float cfx = 0.0f, cfy = 0.0f;
-    const bool ok = CameraForward2D(&cfx, &cfy);
-
-    float pfx = 0.0f, pfy = 0.0f;
+static bool CameraPitchDeg(float* outDeg) {
+    if (!kUseCameraBasis) return false;
     __try {
-        void* app = AppSingleton();
-        void* pl  = app ? reinterpret_cast<GetPlayerObj_t>(R(ADDR_GET_PLAYER))(app, nullptr) : nullptr;
-        if (pl) {
-            const float* pf = reinterpret_cast<const float*>((uintptr_t)pl + OFF_OBJ_FACING);
-            pfx = pf[0]; pfy = pf[1];
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        void* cam = ResolveCamera();
+        if (!cam) return false;
+        int cx = 0, cy = 0;
+        if (!GameClientCentre(&cx, &cy)) return false;
 
-    if (ok) {
-        const float deg = atan2f(cfy, cfx) * 57.2957795f;
-        Log("[DA2] camera fwd (%.4f, %.4f) yaw=%.1f deg  |  Hawke fwd (%.4f, %.4f)\n",
-            cfx, cfy, deg, pfx, pfy);
-    } else {
-        Log("[DA2] camera fwd UNAVAILABLE -- falling back to Hawke fwd (%.4f, %.4f)\n",
-            pfx, pfy);
+        void** vft = *reinterpret_cast<void***>(cam);
+        if (!vft) return false;
+        CamRay_t ray = reinterpret_cast<CamRay_t>(vft[OFF_CAMERA_VF_RAY / 4]);
+        if (!ray) return false;
+
+        __declspec(align(16)) float np[4] = { 0, 0, 0, 0 };
+        __declspec(align(16)) float fp[4] = { 0, 0, 0, 0 };
+        ray(cam, nullptr, cx, cy, np, fp);
+
+        const float dx = fp[0] - np[0], dy = fp[1] - np[1], dz = fp[2] - np[2];
+        const float h2 = dx * dx + dy * dy;
+        if (!(h2 > 1e-6f) || !(h2 < 1e12f)) return false;
+        if (!(dz > -1e6f) || !(dz < 1e6f)) return false;
+        *outDeg = atan2f(dz, sqrtf(h2)) * 57.2957795f;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
 }
 
-static void PollAutoAimToggleKey() {
-    static bool prev = false;
-    const bool now = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
-    if (now && !prev) {
-        g_autoAim = !g_autoAim;
-        Log("[DA2] auto-aim %s\n", g_autoAim ? "ON (ray from screen centre)"
-                                             : "OFF (mouse cursor, D-Pad override)");
+constexpr bool  kCameraAutoLevel  = true;
+constexpr float kCamLevelTarget   = -10.0f;
+constexpr float kCamLevelTol      =   2.5f;
+
+constexpr DWORD kCamLevelSettleMs =  150;
+constexpr DWORD kCamLevelMaxMs    = 5000;
+
+constexpr DWORD kCamLevelHoldMs   =  400;
+constexpr float kCamLevelFar      = 20.0f;
+constexpr float kCamLevelMaxDrive =  2.50f;
+constexpr float kCamLevelMinDrive =  0.15f;
+
+constexpr int   kCamLevelPolarity = -1;
+
+static volatile LONG g_camFixDrive = 0;
+
+static volatile LONG g_newGameCamPending = 0;
+
+static void PollCameraAutoLevel() {
+    if (!kCameraAutoLevel) return;
+
+    enum { S_IDLE, S_WAIT, S_DRIVE, S_DONE };
+    static int   state = S_IDLE;
+    static DWORD enteredAt = 0, driveUntil = 0, lastCheck = 0, inTolSince = 0;
+    static float startPitch = 0.0f, lastPitch = 0.0f;
+    static int   dir = kCamLevelPolarity;
+    static bool  flipped = false;
+
+    if (!InExploreMode()) {
+        if (state != S_IDLE) {
+            InterlockedExchange(&g_camFixDrive, 0);
+            state = S_IDLE;
+        }
+        return;
     }
-    prev = now;
+
+    const DWORD now = GetTickCount();
+
+    if (state == S_IDLE) {
+        enteredAt = now;
+        dir = kCamLevelPolarity;
+        flipped = false;
+        inTolSince = 0;
+        state = S_WAIT;
+        return;
+    }
+    if (state == S_DONE) return;
+
+    if (state == S_WAIT) {
+        if (now - enteredAt < kCamLevelSettleMs) return;
+        float p = 0.0f;
+        if (!CameraPitchDeg(&p)) {
+            if (now - enteredAt > kCamLevelSettleMs + 5000) {
+                Log("[DA2] camera level: no pitch reading, leaving it alone\n");
+                state = S_DONE;
+            }
+            return;
+        }
+        startPitch = lastPitch = p;
+        const bool newGame = InterlockedExchange(&g_newGameCamPending, 0) != 0;
+        Log("[DA2] camera level: entry pitch %+.1f deg (target %+.1f, %s)\n",
+            p, kCamLevelTarget, newGame ? "new game" : "loaded save");
+        if (!newGame) {
+
+            Log("[DA2] camera level: not a new game, leaving it alone\n");
+            state = S_DONE;
+            return;
+        }
+        const float err0 = p - kCamLevelTarget;
+        if (err0 > -kCamLevelTol && err0 < kCamLevelTol) {
+            Log("[DA2] camera level: already where it should be\n");
+            state = S_DONE;
+            return;
+        }
+        driveUntil = now + kCamLevelMaxMs;
+        lastCheck  = now;
+        inTolSince = 0;
+        state = S_DRIVE;
+        return;
+    }
+
+    const float ry = g_pad.ry;
+    if (ry > 0.15f || ry < -0.15f) {
+        Log("[DA2] camera level: player took the stick at %+.1f, stopping\n", lastPitch);
+        InterlockedExchange(&g_camFixDrive, 0);
+        state = S_DONE;
+        return;
+    }
+
+    float p = lastPitch;
+    if (CameraPitchDeg(&p)) {
+        const float err = p - kCamLevelTarget;
+        const float ae  = (err < 0.0f) ? -err : err;
+
+        if (ae <= kCamLevelTol) {
+
+            InterlockedExchange(&g_camFixDrive, 0);
+            if (!inTolSince) inTolSince = now;
+            if (now - inTolSince >= kCamLevelHoldMs) {
+                Log("[DA2] camera level: %+.1f -> %+.1f deg, settled\n", startPitch, p);
+                state = S_DONE;
+                return;
+            }
+        } else {
+            inTolSince = 0;
+
+            float mag = (ae / kCamLevelFar) * kCamLevelMaxDrive;
+            if (mag > kCamLevelMaxDrive) mag = kCamLevelMaxDrive;
+            if (mag < kCamLevelMinDrive) mag = kCamLevelMinDrive;
+            const int sign = (err > 0.0f) ? 1 : -1;
+            InterlockedExchange(&g_camFixDrive,
+                                (LONG)(dir * sign * (int)(mag * 1000.0f)));
+        }
+
+        if (now - lastCheck > 400) {
+            const float dt = (float)(now - lastCheck) / 1000.0f;
+            Log("[DA2] camera level: %+.1f deg, err %+.1f (%.0f deg/s)\n",
+                p, err, dt > 0.0f ? (lastPitch - p) / dt : 0.0f);
+
+            const float aeWas = (lastPitch - kCamLevelTarget < 0.0f)
+                              ? -(lastPitch - kCamLevelTarget)
+                              :  (lastPitch - kCamLevelTarget);
+            if (!flipped && ae > aeWas + 0.5f) {
+                flipped = true;
+                dir = -dir;
+                Log("[DA2] camera level: wrong way (err %+.1f -> %+.1f), flipping\n",
+                    aeWas, ae);
+            }
+            lastCheck = now;
+            lastPitch = p;
+        }
+    }
+
+    if ((LONG)(now - driveUntil) >= 0) {
+        Log("[DA2] camera level: gave up at %+.1f deg (started %+.1f)\n", p, startPitch);
+        InterlockedExchange(&g_camFixDrive, 0);
+        state = S_DONE;
+    }
 }
 
 typedef void (__fastcall* HoverUpd_t)(void* self);
@@ -1990,32 +2389,6 @@ static void PollHoverOverride() {
             *ov = want;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
-}
-
-static void PollCandidateDumpKey() {
-    static bool prev = false;
-    const bool now = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    if (now && !prev) {
-        __try {
-            uintptr_t gm = reinterpret_cast<uintptr_t>(g_hoverOwner);
-            if (!gm) { Log("[DA2] F9: hover updater has not run yet\n"); prev = now; return; }
-
-            const int n = *reinterpret_cast<int*>(gm + OFF_CAND_COUNT);
-            Log("[DA2] F9: candidate count = %d (owner=%p)\n", n, (void*)gm);
-            const int lim = (n > 0 && n < 64) ? n : 0;
-            for (int i = 0; i < lim; ++i) {
-                uint32_t* e = reinterpret_cast<uint32_t*>(gm + OFF_CAND_ARRAY + i * CAND_STRIDE);
-                float* f = reinterpret_cast<float*>(e);
-                Log("[DA2]   cand %2d state=%08X id=%08X | %08X %08X %08X %08X"
-                    "  f: %.2f %.2f %.2f %.2f\n",
-                    i, e[0], e[1], e[2], e[3], e[4], e[5],
-                    f[2], f[3], f[4], f[5]);
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            Log("[DA2] F9: faulted reading the candidate array\n");
-        }
-    }
-    prev = now;
 }
 
 static uint32_t HoveredObjId() {
@@ -2361,6 +2734,104 @@ static bool IsHudLayer(const wchar_t* n) {
 
 static volatile LONG g_menuOpen = 0;
 
+static void RadialForceHide() {
+    InvokeAS2(T_RADIAL, L"RadialQuickbarScene.HideRadialQuickbar");
+    InvokeAS2(T_HUD,    L"BattleMenu.Unfade");
+    InvokeAS2(T_HUD,    L"BattleMenu.MoveToBottomCorner");
+    g_showPending   = false;
+    g_radialVisible = false;
+    OpenRadialScreen();
+}
+
+static void PollRadialStaleHide() {
+    static DWORD leftAt = 0, enteredAt = 0;
+    static bool armed = true;
+
+    if (!InExploreMode()) {
+        if (!leftAt) leftAt = GetTickCount();
+        if (GetTickCount() - leftAt > 1500) { enteredAt = 0; armed = true; }
+        return;
+    }
+    leftAt = 0;
+    if (!armed) return;
+    if (!enteredAt) { enteredAt = GetTickCount(); return; }
+    if (GetTickCount() - enteredAt < 700) return;
+
+    armed = false;
+    if (g_radialVisible || g_showPending) return;
+    RadialForceHide();
+    Log("[DA2] radial: cleared stale panel after area load\n");
+}
+
+static void PollScreen1Probe() {
+    LONG at = InterlockedCompareExchange(&g_probeScreen1At, 0, 0);
+    if (!at || (LONG)(GetTickCount() - (DWORD)at) < 0) return;
+    InterlockedExchange(&g_probeScreen1At, 0);
+
+    void* gui = GuiSystem();
+    if (!gui) { Log("[DA2] PROBE1: no GUI system\n"); return; }
+
+    __try {
+        void** vt = *reinterpret_cast<void***>(gui);
+        auto get = reinterpret_cast<GetScreenByType_t>(vt[0x6C / 4]);
+        void* scr = get(gui, 1);
+        if (!scr) { Log("[DA2] PROBE1: no screen object for type 1\n"); return; }
+
+        __try {
+            void** vft = *reinterpret_cast<void***>(scr);
+            void*  col = vft[-1];
+            const char* cname =
+                reinterpret_cast<const char*>(reinterpret_cast<void**>(col)[3]) + 8;
+            Log("[DA2] PROBE1: screen class %s\n", cname);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[DA2] PROBE1: class name unreadable\n");
+        }
+
+        const uint8_t* s = reinterpret_cast<const uint8_t*>(scr) + OFF_SCREEN_MOVIENAME;
+        char hex[3 * 24 + 1] = {};
+        char asc[24 + 1] = {};
+        for (int i = 0; i < 24; ++i) {
+            _snprintf_s(hex + i * 3, 4, _TRUNCATE, "%02X ", s[i]);
+            asc[i] = (s[i] >= 0x20 && s[i] < 0x7F) ? (char)s[i] : '.';
+        }
+        Log("[DA2] PROBE1: +A8 %s |%s|\n", hex, asc);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[DA2] PROBE1: screen read faulted\n");
+    }
+
+    char line[900];
+    line[0] = 0;
+    int p = 0, n = 0;
+    for (const wchar_t* m : kGuiMovies) {
+        if (!ResolveMovieView(m)) continue;
+        ++n;
+        if (p < (int)sizeof(line) - 40) {
+            const int w = _snprintf_s(line + p, sizeof(line) - p, _TRUNCATE, " %ls", m);
+            if (w > 0) p += w;
+        }
+    }
+    Log("[DA2] PROBE1: %d movies resolve:%s\n", n, line);
+}
+
+static void PollScreen1Watch() {
+    LONG live = 0;
+    void* gui = GuiSystem();
+    if (gui) {
+        __try {
+            void** vt = *reinterpret_cast<void***>(gui);
+            auto get = reinterpret_cast<GetScreenByType_t>(vt[0x6C / 4]);
+
+            const bool onScreen = get(gui, 1) != nullptr;
+            const bool busy = g_radialVisible
+                           || ResolveMovieView(L"conversation") != nullptr;
+            live = (onScreen && !busy) ? 1 : 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { live = 0; }
+    }
+    if (InterlockedExchange(&g_screen1Live, live) != live)
+        Log("[DA2] PROBE1: screen 1 %s\n",
+            live ? "OPEN -- cursor freed, logging its messages" : "closed");
+}
+
 static void PollRadialTrigger() {
     static bool prevLt = false, prevCirc = false, prevCross = false;
     XINPUT_STATE st{};
@@ -2419,6 +2890,54 @@ static int InvokeRawAS(const wchar_t* movie, const char* method) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -3; }
 }
 
+constexpr uintptr_t ADDR_FSCMD_SENDMESSAGE = 0x00775880;
+typedef void (__cdecl* FsSendMessage_t)(void*, const char*);
+static FsSendMessage_t oFsSendMessage = nullptr;
+
+static void __cdecl hkFsSendMessage(void* ctx, const char* args) {
+    __try {
+        if (args && Readable((uintptr_t)args, 16)
+            && strncmp(args, "DA2TRACE ", 9) == 0)
+            Log("[DA2] %.400s\n", args);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    oFsSendMessage(ctx, args);
+}
+
+static ResolveMovie_t oResolveMovie = nullptr;
+
+static void* __fastcall hkResolveMovie(void* reg, void* edx, void* key) {
+    void* r = oResolveMovie(reg, edx, key);
+    if (r && key && InterlockedCompareExchange(&g_screen1Live, 0, 0)) {
+        __try {
+            static unsigned char seen[32][24] = {};
+            static int sn = 0;
+            const unsigned char* k = reinterpret_cast<const unsigned char*>(key);
+            bool isNew = true;
+            for (int i = 0; i < sn; ++i)
+                if (memcmp(seen[i], k, 24) == 0) { isNew = false; break; }
+            if (isNew && sn < 32) {
+                memcpy(seen[sn], k, 24);
+                ++sn;
+
+                char hex[3 * 24 + 1] = {};
+                char asc[24 + 1] = {};
+                for (int i = 0; i < 24; ++i) {
+                    _snprintf_s(hex + i * 3, 4, _TRUNCATE, "%02X ", k[i]);
+                    asc[i] = (k[i] >= 0x20 && k[i] < 0x7F) ? (char)k[i] : '.';
+                }
+                Log("[DA2] RESOLVE: %s |%s|\n", hex, asc);
+                Log("[DA2] RESOLVE   inline=\"%.23ls\"\n",
+                    reinterpret_cast<const wchar_t*>(k));
+                const wchar_t* p = *reinterpret_cast<const wchar_t* const*>(k);
+                if (reinterpret_cast<uintptr_t>(p) >= 0x10000
+                    && reinterpret_cast<uintptr_t>(p) < 0x80000000)
+                    Log("[DA2] RESOLVE   deref =\"%.31ls\"\n", p);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return r;
+}
+
 static void* ResolveMovieView(const wchar_t* name) {
     void* gui = GuiSystem();
     if (!gui) return nullptr;
@@ -2473,15 +2992,6 @@ static bool EntryPickable(uintptr_t e) {
 
 static volatile LONG g_pickerThis = 0;
 
-static volatile LONG g_pickerTrace = 0;
-
-static bool PickerTracing() {
-    LONG n = InterlockedCompareExchange(&g_pickerTrace, 0, 0);
-    if (n <= 0) return false;
-    InterlockedDecrement(&g_pickerTrace);
-    return true;
-}
-
 static uintptr_t PickerThis() {
     return (uintptr_t)(LONG_PTR)InterlockedCompareExchange(&g_pickerThis, 0, 0);
 }
@@ -2496,79 +3006,28 @@ static void* __fastcall hkPickerPick(void* thiz, void* edx) {
             const uintptr_t e  = *reinterpret_cast<uintptr_t*>(gm + OFF_PICK_END);
             if (b && e > b) {
                 const size_t n = (e - b) / PICK_ENTRY_STRIDE;
-                if (n >= 1 && n <= 64) {
-                    const DWORD now = GetTickCount();
-
-                    static DWORD windowStart = 0; static int windowCount = 0;
-                    if (!windowStart) windowStart = now;
-                    if (++windowCount >= 120) {
-                        Log("[DA2] picker: pick called 120x in %ums\n", now - windowStart);
-                        windowStart = now; windowCount = 0;
-                    }
-                    InterlockedExchange(&g_pickerLiveMs, (LONG)now);
-                }
+                if (n >= 1 && n <= 64)
+                    InterlockedExchange(&g_pickerLiveMs, (LONG)GetTickCount());
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-        static uintptr_t saidFor = 0;
-        if ((uintptr_t)thiz != saidFor) {
-            saidFor = (uintptr_t)thiz;
-            __try {
-                Log("[DA2] picker: pick called this=%08X vft=%08X (const says %08X)\n",
-                    (unsigned)(uintptr_t)thiz,
-                    (unsigned)*reinterpret_cast<uintptr_t*>(thiz),
-                    (unsigned)R(ADDR_PICKER_VFTABLE));
-            } __except (EXCEPTION_EXECUTE_HANDLER) {}
-        }
     }
 
     LONG want = InterlockedCompareExchange(&g_pickerSlot, -1, -1);
-    const bool trace = PickerTracing();
-    if (want < 0 || !thiz) {
-        if (trace) Log("[DA2] picker TRACE: passthrough (want=%d thiz=%08X)\n",
-                       (int)want, (unsigned)(uintptr_t)thiz);
-        return oPickerPick(thiz, edx);
-    }
+    if (want < 0 || !thiz) return oPickerPick(thiz, edx);
 
     __try {
         const uintptr_t gm = reinterpret_cast<uintptr_t>(thiz);
 
-        __try {
-            if (*reinterpret_cast<uintptr_t*>(gm) != R(ADDR_PICKER_VFTABLE)) {
-                static bool saidVft = false;
-                if (!saidVft) { saidVft = true;
-                    Log("[DA2] picker: vft mismatch (have %08X want %08X) -- steering anyway\n",
-                        (unsigned)*reinterpret_cast<uintptr_t*>(gm),
-                        (unsigned)R(ADDR_PICKER_VFTABLE)); }
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
         if (*reinterpret_cast<uint8_t*>(gm + OFF_PICK_ACTIVE)
          || *reinterpret_cast<uint8_t*>(gm + OFF_PICK_LOCKED)
-         || *reinterpret_cast<uint8_t*>(gm + OFF_PICK_BLOCKED)) {
-            static bool saidGuard = false;
-            if (!saidGuard) { saidGuard = true;
-                Log("[DA2] picker: guard blocked D8=%d D9=%d 1F0=%d\n",
-                    *reinterpret_cast<uint8_t*>(gm + OFF_PICK_ACTIVE),
-                    *reinterpret_cast<uint8_t*>(gm + OFF_PICK_LOCKED),
-                    *reinterpret_cast<uint8_t*>(gm + OFF_PICK_BLOCKED)); }
-            if (trace) Log("[DA2] picker TRACE: guard blocked\n");
+         || *reinterpret_cast<uint8_t*>(gm + OFF_PICK_BLOCKED))
             return oPickerPick(thiz, edx);
-        }
 
         const uintptr_t b = *reinterpret_cast<uintptr_t*>(gm + OFF_PICK_BEGIN);
         const uintptr_t e = *reinterpret_cast<uintptr_t*>(gm + OFF_PICK_END);
-        if (!b || e <= b) {
-            if (trace) Log("[DA2] picker TRACE: no entry list (b=%08X e=%08X)\n",
-                           (unsigned)b, (unsigned)e);
-            return oPickerPick(thiz, edx);
-        }
+        if (!b || e <= b) return oPickerPick(thiz, edx);
         const int n = static_cast<int>((e - b) / PICK_ENTRY_STRIDE);
-        if (n <= 0 || n > 64) {
-            if (trace) Log("[DA2] picker TRACE: bad count n=%d\n", n);
-            return oPickerPick(thiz, edx);
-        }
-        if (trace) Log("[DA2] picker TRACE: steering want=%d n=%d\n", (int)want, n);
+        if (n <= 0 || n > 64) return oPickerPick(thiz, edx);
 
         const int dir = (int)InterlockedCompareExchange(&g_pickerDir, 0, 0) >= 0 ? 1 : -1;
         for (int k = 0; k < n; ++k) {
@@ -2579,17 +3038,9 @@ static void* __fastcall hkPickerPick(void* thiz, void* edx) {
             if (EntryPickable(entry)) {
 
                 if (slot != want) InterlockedExchange(&g_pickerSlot, slot);
-                static int lastServed = -1;
-                if (i != lastServed) {
-                    lastServed = i;
-                    Log("[DA2] picker: slot %d -> entry %d @%08X state=%d\n",
-                        slot, i, (unsigned)entry,
-                        *reinterpret_cast<uint32_t*>(entry + OFF_ENTRY_STATE));
-                }
                 return reinterpret_cast<void*>(entry);
             }
         }
-        if (trace) Log("[DA2] picker TRACE: no pickable entry for want=%d\n", (int)want);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return oPickerPick(thiz, edx);
 }
@@ -2597,59 +3048,6 @@ static void* __fastcall hkPickerPick(void* thiz, void* edx) {
 static bool SafeFloat(uintptr_t p, float* out) {
     __try { *out = *reinterpret_cast<float*>(p); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-
-static void ScanPickerOrderingCandidates() {
-    const uintptr_t gm = PickerThis();
-    if (!gm) return;
-    uintptr_t b = 0, e = 0;
-    __try {
-        b = *reinterpret_cast<uintptr_t*>(gm + OFF_PICK_BEGIN);
-        e = *reinterpret_cast<uintptr_t*>(gm + OFF_PICK_END);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
-    if (!b || e <= b) return;
-    const int n = static_cast<int>((e - b) / PICK_ENTRY_STRIDE);
-    if (n < 2 || n > 16) return;
-
-    uintptr_t cre[16] = {};
-    __try {
-        for (int i = 0; i < n; ++i) {
-            const uintptr_t en = b + (size_t)i * PICK_ENTRY_STRIDE;
-            cre[i] = *reinterpret_cast<uintptr_t*>(en + 0x04);
-            Log("[DA2]   entry %d @%08X creature=%08X id=%08X state=%d locked=%d\n",
-                i, (unsigned)en, (unsigned)cre[i],
-                *reinterpret_cast<uint32_t*>(en + 0x00),
-                *reinterpret_cast<uint32_t*>(en + OFF_ENTRY_STATE),
-                *reinterpret_cast<uint8_t*>(en + OFF_ENTRY_LOCKED));
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { Log("[DA2] picker scan: entry read faulted\n"); return; }
-
-    Log("[DA2] picker scan: creature offsets distinct across all %d entries\n", n);
-    int reported = 0;
-    for (uint32_t o = 0; o <= 0x400 && reported < 40; o += 4) {
-        float v[16];
-        bool ok = true;
-        for (int i = 0; i < n && ok; ++i) {
-            if (!cre[i] || !SafeFloat(cre[i] + o, &v[i])) { ok = false; break; }
-            const float f = v[i];
-            if (!(f > -100000.0f && f < 100000.0f) || f != f) ok = false;
-        }
-        if (!ok) continue;
-        int distinct = 0;
-        for (int i = 0; i < n; ++i) {
-            bool dup = false;
-            for (int j = 0; j < i; ++j) if (v[j] == v[i]) dup = true;
-            if (!dup) ++distinct;
-        }
-        if (distinct < n) continue;
-        char line[512];
-        int p = _snprintf_s(line, _countof(line), _TRUNCATE, "[DA2]   cre+%03X:", o);
-        for (int i = 0; i < n && p > 0 && p < (int)_countof(line) - 16; ++i)
-            p += _snprintf_s(line + p, _countof(line) - p, _TRUNCATE, " %9.2f", v[i]);
-        Log("%s\n", line);
-        ++reported;
-    }
-    if (!reported) Log("[DA2]   (no per-entry float found -- widen the scan)\n");
 }
 
 constexpr uintptr_t OFF_CRE_POS_X = 0x160;
@@ -2705,38 +3103,12 @@ static int PickerEntryForSlot(int slot, int n) {
     return slot;
 }
 
-static void DumpPickerState() {
-    __try {
-
-        uintptr_t gm = PickerThis();
-        if (!gm) { Log("[DA2] picker: pick seam has not fired yet -- no this\n"); return; }
-        uintptr_t vf = *reinterpret_cast<uintptr_t*>(gm);
-        uintptr_t b  = *reinterpret_cast<uintptr_t*>(gm + OFF_PICK_BEGIN);
-        uintptr_t e  = *reinterpret_cast<uintptr_t*>(gm + OFF_PICK_END);
-        uintptr_t c  = *reinterpret_cast<uintptr_t*>(gm + 0xC4);
-        uintptr_t s  = *reinterpret_cast<uintptr_t*>(gm + 0x184);
-        uintptr_t s2 = *reinterpret_cast<uintptr_t*>(gm + 0x188);
-        Log("[DA2] picker: gm=%08X vft=%08X (want %08X) D8=%d D9=%d 1F0=%d 1E0=%d\n",
-            (unsigned)gm, (unsigned)vf, (unsigned)R(ADDR_PICKER_VFTABLE),
-            *reinterpret_cast<uint8_t*>(gm + OFF_PICK_ACTIVE),
-            *reinterpret_cast<uint8_t*>(gm + OFF_PICK_LOCKED),
-            *reinterpret_cast<uint8_t*>(gm + OFF_PICK_BLOCKED),
-            *reinterpret_cast<uint8_t*>(gm + 0x1E0));
-        Log("[DA2] picker: entries begin=%08X end=%08X cap=%08X n=%d | creatures n=%d\n",
-            (unsigned)b, (unsigned)e, (unsigned)c,
-            (b && e > b) ? (int)((e - b) / PICK_ENTRY_STRIDE) : 0,
-            (s && s2 > s) ? (int)((s2 - s) / 4) : 0);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { Log("[DA2] picker: dump faulted\n"); }
-}
-
 static void EnsurePickerOrder() {
     const uintptr_t gm = PickerThis();
     if (!gm) return;
     if (InterlockedCompareExchange(&g_pickerOrderFor, 0, 0) == (LONG)gm) return;
     InterlockedExchange(&g_pickerOrderFor, (LONG)gm);
-    DumpPickerState();
     BuildPickerOrder();
-    ScanPickerOrderingCandidates();
 }
 
 static void StepPickerSlot(int dir) {
@@ -2749,7 +3121,7 @@ static void StepPickerSlot(int dir) {
             if (b && e > b) n = static_cast<int>((e - b) / PICK_ENTRY_STRIDE);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { n = 0; }
-    if (n <= 0 || n > 64) { DumpPickerState(); return; }
+    if (n <= 0 || n > 64) return;
 
     InterlockedExchange(&g_pickerDir, dir);
     LONG cur = InterlockedCompareExchange(&g_pickerSlot, -1, -1);
@@ -2767,6 +3139,8 @@ static void UpdateChargenState() {
 
     const LONG slotBefore = InterlockedCompareExchange(&g_pickerSlot, -1, -1);
     InterlockedExchange(&g_chargenActive, up ? 1 : 0);
+
+    if (up) InterlockedExchange(&g_newGameCamPending, 1);
     if (up) Log("[DA2] picker detected by %s\n",
                 byMovie ? (byPick ? "movie+pick" : "movie name") : "pick function");
 
@@ -2791,8 +3165,6 @@ static void UpdateChargenState() {
         InterlockedExchange(&g_pickerSlot, -1);
         InterlockedExchange(&g_pickerAutoAt, (LONG)(GetTickCount() + kPickerAutoDelayMs));
         InterlockedExchange(&g_pickerAutoStage, 1);
-        InterlockedExchange(&g_pickerTrace, 40);
-        Log("[DA2] picker: will auto-select slot 0 in %ums\n", kPickerAutoDelayMs);
     } else {
         InterlockedExchange(&g_pickerClosedAt, (LONG)GetTickCount());
         InterlockedExchange(&g_pickerAutoStage, 0);
@@ -2907,18 +3279,28 @@ static float __fastcall hkActionAnalog(void* thiz, void* edx, uint32_t* handle) 
             }
         }
 
-        PollInvokeBurstKey();
-        PollCandidateDumpKey();
-        PollAutoAimToggleKey();
-        PollCameraProbeKey();
         PollAutoAim();
         PollArmedAbilityWatch();
         PollHoverOverride();
         PollOptionsMouse();
+
+        {
+            int cx = 0, cy = 0;
+            if (GameClientCentre(&cx, &cy)) {
+                InterlockedExchange(&g_clientCx, cx);
+                InterlockedExchange(&g_clientCy, cy);
+            }
+        }
         PollCursorHide();
         PollCursorPark();
         PollLoginBlock();
+        PollScreen1Probe();
+        PollScreen1Watch();
         PollCursorToggleKey();
+        PollRumbleStop();
+        PollCameraAutoLevel();
+        PollHealthStat();
+        PollRadialStaleHide();
         PollRadialTrigger();
         PollAoeTargeting();
         UpdateConsolePause();
@@ -2933,6 +3315,18 @@ static float __fastcall hkActionAnalog(void* thiz, void* edx, uint32_t* handle) 
         return oActionAnalog(thiz, edx, handle);
     }
 
+    if (handle && InterlockedCompareExchange(&g_screen1Live, 0, 0)) {
+        static uint32_t seen[128] = {};
+        static int sn = 0;
+        bool isNew = true;
+        for (int k = 0; k < sn; ++k)
+            if (seen[k] == handle[0]) { isNew = false; break; }
+        if (isNew && sn < 128) {
+            seen[sn++] = handle[0];
+            Log("[DA2] CHARGEN ACT-A: 0x%02X\n", handle[0]);
+        }
+    }
+
     if (handle) {
         if (handle[0] == ACT_GUI_LT) {
 
@@ -2944,25 +3338,54 @@ static float __fastcall hkActionAnalog(void* thiz, void* edx, uint32_t* handle) 
         else if (handle[0] == ACT_GUI_RY) PollPadAndDispatch(true);
     }
 
-    if (handle) {
-        const uint32_t id0 = handle[0];
-        if (id0 == ACT_AUTOTARGET_X || id0 == ACT_AUTOTARGET_Y ||
-            id0 == ACT_ENABLE_AUTOTARGET || id0 == ACT_LINEAR_TGT_MODE ||
-            id0 == ACT_FILTER_HOSTILE || id0 == ACT_FILTER_PARTY) {
-            static uint32_t seen = 0;
-            uint32_t bit = 1u << (id0 & 31);
-            if (!(seen & bit)) { seen |= bit; Log("[DA2] engine queried target action 0x%02X\n", id0); }
-        }
-    }
-
     if (handle && InterlockedCompareExchange(&g_pad.valid, 1, 1)) {
         const uint32_t id = handle[0];
         const float rx = g_pad.rx, ry = g_pad.ry;
+
+        {
+            static bool wasPlaying = false;
+            static bool needRecentre = false;
+            const bool playing = InExploreMode();
+            if (playing && !wasPlaying) needRecentre = true;
+            wasPlaying = playing;
+            if (needRecentre) {
+                const float ax = rx < 0 ? -rx : rx;
+                const float ay = ry < 0 ? -ry : ry;
+                if (ax < 0.05f && ay < 0.05f) {
+                    needRecentre = false;
+                    Log("[DA2] camera: stick centred, input accepted\n");
+                } else if (id == ACT_CAMERA_YAW || id == ACT_CAMERA_PITCH) {
+                    static int said = 0;
+                    if (said < 3) { ++said;
+                        Log("[DA2] camera: ignoring deflection present at entry"
+                            " (rx=%+.3f ry=%+.3f)\n", rx, ry); }
+                    return oActionAnalog(thiz, edx, handle);
+                }
+            }
+        }
+
+        if (id == ACT_CAMERA_YAW || id == ACT_CAMERA_PITCH) {
+            if (!InExploreMode()) {
+                static bool said = false;
+                if (!said && (rx != 0.0f || ry != 0.0f)) { said = true;
+                    Log("[DA2] camera feed suppressed outside gameplay"
+                        " (rx=%+.3f ry=%+.3f)\n", rx, ry); }
+                return oActionAnalog(thiz, edx, handle);
+            }
+        }
 
         if (id == ACT_CAMERA_YAW && rx != 0.0f)
             return (CAMERA_INVERT_YAW ? -rx : rx) * CAMERA_SENS_YAW;
         if (id == ACT_CAMERA_PITCH && ry != 0.0f)
             return (CAMERA_INVERT_PITCH ? -ry : ry) * CAMERA_SENS_PITCH;
+
+        if (id == ACT_CAMERA_PITCH && ry == 0.0f) {
+            const LONG d = InterlockedCompareExchange(&g_camFixDrive, 0, 0);
+            if (d) {
+                const float synth = (float)d / 1000.0f;
+                return (CAMERA_INVERT_PITCH ? -synth : synth) * CAMERA_SENS_PITCH;
+            }
+        }
 
         if (id == ACT_CAM_ZOOM) {
             if (InterlockedCompareExchange(&g_pad.zoomIn, 1, 1))  return  ZOOM_STEP;
@@ -2998,6 +3421,18 @@ static float __fastcall hkActionAnalog(void* thiz, void* edx, uint32_t* handle) 
 static char __fastcall hkActionDigital(void* thiz, void* edx, uint32_t* handle) {
 
     if (DialogIsOpen()) return oActionDigital(thiz, edx, handle);
+
+    if (handle && InterlockedCompareExchange(&g_screen1Live, 0, 0)) {
+        static uint32_t seen[128] = {};
+        static int sn = 0;
+        bool isNew = true;
+        for (int k = 0; k < sn; ++k)
+            if (seen[k] == handle[0]) { isNew = false; break; }
+        if (isNew && sn < 128) {
+            seen[sn++] = handle[0];
+            Log("[DA2] CHARGEN ACT-D: 0x%02X\n", handle[0]);
+        }
+    }
 
     if (handle && InterlockedCompareExchange(&g_pad.valid, 1, 1)) {
         switch (handle[0]) {
@@ -3088,6 +3523,7 @@ static void PollPadAndDispatch(bool dispatchEvents) {
     g_pad.ly = DeadZone(st.Gamepad.sThumbLY / 32767.0f, CAM_DEADZONE);
     g_pad.rx = DeadZone(st.Gamepad.sThumbRX / 32767.0f, CAM_DEADZONE);
     g_pad.ry = DeadZone(st.Gamepad.sThumbRY / 32767.0f, CAM_DEADZONE);
+
     g_pad.lt = st.Gamepad.bLeftTrigger  / 255.0f;
     g_pad.rt = st.Gamepad.bRightTrigger / 255.0f;
     const WORD wb = st.Gamepad.wButtons;
@@ -3654,7 +4090,8 @@ static DWORD WINAPI TitleAndMovieSkipThread(LPVOID) {
                 SynthKey(VK_ESCAPE);
             }
         }
-        if (a && !prevA) {
+
+        if (a && !prevA && !InterlockedCompareExchange(&g_screen1Live, 0, 0)) {
             Log("[DA2] any-key (A)\n");
             SynthKey(VK_SPACE);
             SynthKey(VK_RETURN);
@@ -3880,6 +4317,15 @@ static DWORD WINAPI InitThread(LPVOID) {
         Log("[DA2] HOOK FAILED: user32!SetCursor -- the cursor will stay visible\n");
     }
 
+    if (MH_CreateHookApi(L"xinput1_3", "XInputSetState", &hkXInputSetState,
+                         (LPVOID*)&oXInputSetState) == MH_OK &&
+        MH_QueueEnableHook(MH_ALL_HOOKS) == MH_OK) {
+        Log("[DA2] hook queued: xinput1_3!XInputSetState (rumble watch)\n");
+    } else {
+
+        Log("[DA2] rumble watch: xinput1_3!XInputSetState not hookable\n");
+    }
+
     Arm(ADDR_OPEN_SCREEN,     &hkOpenScreen, (LPVOID*)&oOpenScreen, "OpenScreenByType");
     Arm(ADDR_MOVEMENT_READER, &hkMoveReader, (LPVOID*)&oMoveReader, "movement/poll");
     Arm(ADDR_ACTION_ANALOG,   &hkActionAnalog,  (LPVOID*)&oActionAnalog,  "action analog");
@@ -3887,10 +4333,10 @@ static DWORD WINAPI InitThread(LPVOID) {
     Arm(ADDR_PICKER_PICK,     &hkPickerPick,    (LPVOID*)&oPickerPick,    "partypicker pick");
     Arm(0x00623830,           &hkShowDialog,    (LPVOID*)&oShowDialog,    "ShowDialogBox handler");
 
-    InitializeCriticalSection(&g_invokeCs);
-    g_invokeCsReady = true;
-    Arm(0x0076B880,           &hkInvokeAS,      (LPVOID*)&oInvokeAS,      "Movie::InvokeAS (name log)");
-    Arm(ADDR_DISPATCH,        &hkDispatch,      (LPVOID*)&oDispatch,      "Dispatch (message name log)");
+    Arm(0x0076B880,           &hkInvokeAS,      (LPVOID*)&oInvokeAS,      "Movie::InvokeAS (tutorial swap)");
+    Arm(ADDR_FSCMD_SENDMESSAGE, &hkFsSendMessage, (LPVOID*)&oFsSendMessage, "fscommand SendMessage (AS2 trace pipe)");
+    Arm(ADDR_RESOLVE_MOVIE,   &hkResolveMovie,  (LPVOID*)&oResolveMovie,  "ResolveMovie (name probe)");
+    Arm(ADDR_DISPATCH,        &hkDispatch,      (LPVOID*)&oDispatch,      "Dispatch (rumble + radial close)");
     Arm(ADDR_CURSOR_POS,        &hkCursorPos,        (LPVOID*)&oCursorPos,        "cursor position (auto-aim feed)");
     Arm(ADDR_HOVER_UPDATE,      &hkHoverUpdate,      (LPVOID*)&oHoverUpdate,      "hover updater (capture owner)");
     Arm(ADDR_EXPLORE_PRIMARY,   &hkExplorePrimary,   (LPVOID*)&oExplorePrimary,   "GameModeExplore primary action");

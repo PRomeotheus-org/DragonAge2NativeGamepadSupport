@@ -1,4 +1,6 @@
 // Dragon Age II -- console controls and console UI for the PC build.
+// Release build: no diagnostic output. See the development source for why any
+// of this is shaped the way it is.
 
 #include <windows.h>
 
