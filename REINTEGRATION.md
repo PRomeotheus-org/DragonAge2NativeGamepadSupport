@@ -10,12 +10,17 @@ Two commits on top of upstream `23a003b "Removed leftover traces"`
 | `9551319` | `build-all.cmd` (new, +32), `build.log` (new, +37) | build only — calls vcvars32 + builds `libMinHook.x86.lib` from `E:\RE\Projects\minhook-src`, then `call build.bat`. Does NOT change his compile flags. |
 | `493a3f3` | `da2_console.cpp` (+15), `da2_console.ini` (+1 key) | the "Button swap" feature only |
 
-The whole feature is 15 lines in 3 places:
-- `int g_buttonSwap` + `static inline int SwapAB(int)` — file scope, right after the
-  `GpButton` enum (~line 103)
-- one call site: `SendGamepadEvent(SwapAB(m.id), down)` in `PollPadAndDispatch()` (~line 3536)
-- `g_buttonSwap = GetPrivateProfileIntW(L"DA2", L"Button swap", 0, ini)` in
-  `ApplyConsoleVersion()` (~line 4094)
+The whole feature is 15 lines in 3 places (line numbers are for HEAD `9114610`;
+locate them by the grep strings, since lines drift after any upstream merge):
+
+```
+da2_console.cpp:110   static inline int SwapAB(int id) {          (file scope, right after the GpButton enum + int g_buttonSwap)
+da2_console.cpp:3539  SendGamepadEvent(SwapAB(m.id), down);        (in PollPadAndDispatch)
+da2_console.cpp:4097  g_buttonSwap = GetPrivateProfileIntW(L"DA2", L"Button swap", 0, ini);   (in ApplyConsoleVersion)
+```
+
+Find them again after a merge with:
+`grep -n "SwapAB\|Button swap" da2_console.cpp da2_console.ini`
 
 Tag `da2-tested-20261101` marks the state Juan verified in game.
 
