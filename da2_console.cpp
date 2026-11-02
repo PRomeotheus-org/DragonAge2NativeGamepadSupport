@@ -103,6 +103,16 @@ enum GpButton : int {
     GP_RightThumbLeft = 25, GP_RightThumbRight = 26,
     GP_LeftTrigger = 31, GP_RightTrigger = 32,
 };
+
+// Natasha: optional A/B semantic swap for Xbox pads (engine accepts via
+// RightAction id, PS3-era convention). Ini: [DA2] Button swap=1
+int g_buttonSwap = 0;
+static inline int SwapAB(int id) {
+    if (!g_buttonSwap) return id;
+    if (id == GP_BottomAction) return GP_RightAction;
+    if (id == GP_RightAction)  return GP_BottomAction;
+    return id;
+}
 constexpr int GP_EVENT_PRESSED  = 0x10000;
 constexpr int GP_EVENT_RELEASED = 0x20000;
 
@@ -3514,6 +3524,7 @@ static void PollPadAndDispatch(bool dispatchEvents) {
         { XINPUT_GAMEPAD_LEFT_SHOULDER,  GP_LeftShoulder  },
         { XINPUT_GAMEPAD_RIGHT_SHOULDER, GP_RightShoulder },
     };
+    // (SwapAB helper lives at file scope next to GpButton enum)
     static WORD prevButtons = 0;
     const WORD b = st.Gamepad.wButtons;
     const WORD changed = b ^ prevButtons;
@@ -3525,7 +3536,7 @@ static void PollPadAndDispatch(bool dispatchEvents) {
             if (!(changed & m.mask)) continue;
             const bool down = (b & m.mask) != 0;
             if (eatA && m.mask == XINPUT_GAMEPAD_A && down) continue;
-            SendGamepadEvent(m.id, down);
+            SendGamepadEvent(SwapAB(m.id), down);
         }
         prevButtons = b;
     }
@@ -4083,6 +4094,8 @@ static void ApplyConsoleVersion() {
     }
     Log("[DA2] ini: reading %ls\n", ini);
     g_consoleVersion = (int)GetPrivateProfileIntW(L"DA2", L"Console version", 1, ini);
+    g_buttonSwap = (int)GetPrivateProfileIntW(L"DA2", L"Button swap", 0, ini);
+    Log("[DA2] ini: Button swap=%d\n", g_buttonSwap);
     if (g_consoleVersion != 1 && g_consoleVersion != 2) {
         Log("[DA2] ini: Console version=%d is not 1 or 2 -- using 1 (PS3)\n", g_consoleVersion);
         g_consoleVersion = 1;
