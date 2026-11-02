@@ -1,0 +1,37 @@
+===MINHOOK-STATIC-BUILD===
+buffer.c
+hook.c
+trampoline.c
+hde32.c
+hde64.c
+Generating Code...
+        1 file(s) copied.
+libMinHook built:
+11/01/2026  08:12 PM            30,352 libMinHook.x86.lib
+===PROXY-BUILD===
+Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36246 for x86
+Copyright (C) Microsoft Corporation.  All rights reserved.
+
+da2_proxy.cpp
+da2_console.cpp
+Generating Code...
+Microsoft (R) Incremental Linker Version 14.51.36246.0
+Copyright (C) Microsoft Corporation.  All rights reserved.
+
+/dll 
+/implib:dinput8.lib 
+/out:dinput8.dll 
+/LTCG 
+/DEF:da2_proxy.def 
+da2_proxy.obj 
+da2_console.obj 
+..\libMinHook.x86.lib 
+XInput9_1_0.lib 
+user32.lib 
+shell32.lib 
+   Creating library dinput8.lib and object dinput8.exp
+LINK : /LTCG specified but no code generation required; remove /LTCG from the link command line to improve linker performance
+===ARTIFACT===
+11/01/2026  08:12 PM           233,984 dinput8.dll
+ac7d3dc870aff8447154f832e09deb069d301cf665e704a8a045a76a0a977485
+===ALL-DONE===
